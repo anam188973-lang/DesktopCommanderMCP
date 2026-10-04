@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+CLIENT=/srv/nightaround-ops/current/packaging/nightaround-ops-privileged-client.mjs
+ACTION=${1:-}
+case "$ACTION" in
+  activate)
+    [ "$#" -eq 2 ] || { echo 'usage: activate RELEASE' >&2; exit 64; }
+    exec /opt/nightaround-node22/bin/node "$CLIENT" activate-workflow-release "$2"
+    ;;
+  resume)
+    [ "$#" -eq 1 ] || { echo 'usage: resume' >&2; exit 64; }
+    exec /opt/nightaround-node22/bin/node "$CLIENT" resume-workflow-content
+    ;;
+  promote-and-resume)
+    [ "$#" -eq 2 ] || { echo 'usage: promote-and-resume RELEASE' >&2; exit 64; }
+    /opt/nightaround-node22/bin/node "$CLIENT" activate-workflow-release "$2"
+    exec /opt/nightaround-node22/bin/node "$CLIENT" resume-workflow-content
+    ;;
+  *) echo 'allowed actions: activate, resume, promote-and-resume' >&2; exit 64;;
+esac
