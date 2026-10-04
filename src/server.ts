@@ -78,6 +78,7 @@ import {
 } from './ui/contracts.js';
 import { listUiResources, readUiResource } from './ui/resources.js';
 import { shouldShowMcpUiPreviews } from './utils/mcp-ui-ab-test.js';
+import { nightaroundOpsTools, handleNightaroundOpsTool, isNightaroundOpsTool, auditToolCall } from './nightaround-ops.js';
 
 // Store startup messages to send after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -284,6 +285,12 @@ deferLog('info', 'Setting up request handlers...');
  * Check if a tool should be included based on current client
  */
 function shouldIncludeTool(toolName: string): boolean {
+    // Nightaround Ops policy: clients cannot mutate guardrails, send feedback,
+    // invoke onboarding, or advertise browser-backed PDF generation.
+    if (["set_config_value", "write_pdf", "give_feedback_to_desktop_commander", "get_prompts", "track_ui_event"].includes(toolName)) {
+        return false;
+    }
+
     // Exclude these tools for desktop-commander client (DC-specific meta-tools not useful when DC itself is the client)
     if (currentClient?.name === 'desktop-commander-app') {
         if (toolName === 'give_feedback_to_desktop_commander' || toolName === 'get_prompts') {
@@ -1230,7 +1237,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     title: "Get Prompts",
                     readOnlyHint: true,
                 },
-            }
+            },
+            ...nightaroundOpsTools,
         ];
 
         // Filter tools based on current client
@@ -1531,16 +1539,21 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
                 break;
 
             default:
-                capture('server_unknown_tool', { name });
-                result = {
-                    content: [{ type: "text", text: `Error: Unknown tool: ${name}` }],
-                    isError: true,
-                };
+                if (isNightaroundOpsTool(name)) {
+                    result = await handleNightaroundOpsTool(name, args);
+                } else {
+                    capture('server_unknown_tool', { name });
+                    result = {
+                        content: [{ type: "text", text: `Error: Unknown tool: ${name}` }],
+                        isError: true,
+                    };
+                }
         }
 
         // Add tool call to history (exclude only get_recent_tool_calls to prevent recursion)
         const duration = Date.now() - startTime;
         isError = !!result.isError;
+        await auditToolCall(name, args, result, duration);
         const EXCLUDED_TOOLS = [
             'get_recent_tool_calls',
             'track_ui_event'
