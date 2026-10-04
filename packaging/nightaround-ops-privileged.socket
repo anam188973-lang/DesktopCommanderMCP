@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightaround Ops privileged broker socket
+
+[Socket]
+ListenStream=/run/nightaround-ops-privileged.sock
+SocketUser=root
+SocketGroup=nightaround-ops
+SocketMode=0660
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
