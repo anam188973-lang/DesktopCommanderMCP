@@ -1,0 +1,141 @@
+#!/bin/sh
+set -eu
+
+ops_root=/srv/nightaround-ops
+
+if [ "${1:-}" = --socket ]; then
+  [ "$(id -u)" -eq 0 ] || { echo 'broker must run as root' >&2; exit 77; }
+  IFS="$(printf '\t')" read -r request_action request_arg1 request_arg2 request_extra || true
+  [ -z "${request_extra:-}" ] || { echo 'too many request fields' >&2; exit 64; }
+  set -- "${request_action:-}" "${request_arg1:-}" "${request_arg2:-}"
+  trap 'status=$?; printf "__NIGHTAROUND_BROKER_EXIT__=%s\n" "$status"' EXIT
+  /usr/bin/logger --tag nightaround-ops-privileged -- "action=${request_action:-missing} target=${request_arg1:-none}"
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo 'root execution required' >&2; exit 77; }
+action=${1:-}
+
+approved_service() {
+  case "$1" in
+    nightaround-ops.service|nightaround-mcp-cloudflared.service|nightaround-ai-doer-mcp.service|nightaround-entity-mcp.service|nightaround-expired-domain-mcp.service|nightaround-cloud-control.service|nightaround-workflow-content-resume.service) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_release() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+atomic_switch() {
+  pointer=$1
+  target=$2
+  parent=$(dirname "$pointer")
+  temporary="$parent/.current.$$.tmp"
+  ln -s "$target" "$temporary"
+  mv -Tf "$temporary" "$pointer"
+}
+
+set_release_env() {
+  target=$1
+  release_name=$(basename "$target")
+  temporary="$ops_root/config/.release.$$.tmp"
+  printf 'NIGHTAROUND_OPS_RELEASE=%s\n' "$release_name" > "$temporary"
+  chown root:nightaround-ops "$temporary"
+  chmod 0640 "$temporary"
+  mv -Tf "$temporary" "$ops_root/config/release.env"
+}
+
+case "$action" in
+  journal)
+    service=${2:-}
+    lines=${3:-100}
+    approved_service "$service" || { echo 'service not approved' >&2; exit 64; }
+    case "$lines" in ''|*[!0-9]*) echo 'invalid line count' >&2; exit 64;; esac
+    [ "$lines" -ge 1 ] && [ "$lines" -le 500 ] || { echo 'line count outside 1..500' >&2; exit 64; }
+    /usr/bin/journalctl --no-pager --output=short-iso -u "$service" -n "$lines"
+    ;;
+  restart)
+    service=${2:-}
+    [ "$service" = nightaround-ops-tunnel.service ] || { echo 'restart not approved' >&2; exit 64; }
+    /usr/bin/systemctl restart "$service"
+    /usr/bin/systemctl is-active "$service"
+    ;;
+  activate-workflow-release)
+    release=${2:-}
+    [ -z "${3:-}" ] || { echo 'activate-workflow-release takes one release name' >&2; exit 64; }
+    valid_release "$release" || { echo 'invalid workflow release' >&2; exit 64; }
+    candidate="/srv/nightaround-ops/workflow-candidates/$release"
+    [ -d "$candidate" ] || { echo 'workflow release candidate missing' >&2; exit 65; }
+    /usr/bin/find "$candidate" -type d -exec /usr/bin/chmod 0755 {} +
+    /usr/bin/find "$candidate" -type f -exec /usr/bin/chmod 0644 {} +
+    /usr/local/sbin/nightaround-validate-workflow-release "$candidate" || { echo 'workflow release validation failed' >&2; exit 65; }
+    (cd "$candidate" && /usr/bin/sha256sum -c MANIFEST.sha256 >/dev/null) || exit 65
+    if /usr/bin/systemctl is-active --quiet nightaround-workflow-content-resume.service; then echo 'workflow-content already running' >&2; exit 75; fi
+    /usr/bin/flock -n /srv/ai-doer-mcp/nightaround-selected-runtime2/db/locks/s01_s10_draft_only.lock /usr/bin/true || { echo 'workflow-content lock is held' >&2; exit 75; }
+    manifest_hash=$(/usr/bin/sha256sum "$candidate/MANIFEST.sha256" | /usr/bin/awk '{print $1}')
+    mkdir -p /srv/nightaround-workflow-content
+    [ ! -f /srv/nightaround-workflow-content/current.approval ] || cp -p /srv/nightaround-workflow-content/current.approval /srv/nightaround-workflow-content/previous.approval
+    printf '%s %s\n' "$release" "$manifest_hash" > /srv/nightaround-workflow-content/.approval.$$.tmp
+    chmod 0644 /srv/nightaround-workflow-content/.approval.$$.tmp
+    mv -Tf /srv/nightaround-workflow-content/.approval.$$.tmp /srv/nightaround-workflow-content/current.approval
+    if ! /usr/sbin/runuser -u ai-doer-mcp -- /usr/bin/env HOME=/srv/ai-doer-mcp PATH=/usr/bin:/bin:/usr/local/bin NIGHTAROUND_WORKFLOW_PREFLIGHT_ONLY=1 /bin/bash /srv/nightaround-ops/current/packaging/nightaround-workflow-content-resume; then
+      if [ -f /srv/nightaround-workflow-content/previous.approval ]; then
+        cp -p /srv/nightaround-workflow-content/previous.approval /srv/nightaround-workflow-content/current.approval
+      else
+        rm -f /srv/nightaround-workflow-content/current.approval
+      fi
+      echo 'workflow release preflight failed; approval rolled back' >&2
+      exit 65
+    fi
+    printf 'WORKFLOW_RELEASE_ACTIVATED=%s manifest=%s\n' "$release" "$manifest_hash"
+    ;;
+  resume-workflow-content)
+    [ -z "${2:-}" ] && [ -z "${3:-}" ] || { echo 'resume-workflow-content takes no arguments' >&2; exit 64; }
+    unit=nightaround-workflow-content-resume.service
+    if /usr/bin/systemctl is-active --quiet "$unit"; then echo 'workflow-content already running' >&2; exit 75; fi
+    if /usr/bin/pgrep -f 'nightaround-workflow-content-resume|runtime_run_joined_current_v2.py' >/dev/null 2>&1; then echo 'workflow-content process already running' >&2; exit 75; fi
+    /usr/bin/flock -n /srv/ai-doer-mcp/nightaround-selected-runtime2/db/locks/s01_s10_draft_only.lock /usr/bin/true || { echo 'workflow-content lock is held' >&2; exit 75; }
+    /usr/bin/systemctl start --no-block "$unit"
+    printf 'WORKFLOW_CONTENT_RESUME=STARTED unit=%s\n' "$unit"
+    ;;
+  deploy)
+    track=${2:-}
+    release=${3:-}
+    valid_release "$release" || { echo 'invalid release' >&2; exit 64; }
+    case "$track" in
+      production) releases="$ops_root/releases"; pointer="$ops_root/current"; previous="$ops_root/rollback/production.previous" ;;
+      test) releases="$ops_root/test-releases"; pointer="$ops_root/state/test-current"; previous="$ops_root/rollback/test.previous" ;;
+      *) echo 'invalid track' >&2; exit 64 ;;
+    esac
+    target="$releases/$release"
+    [ -d "$target" ] && [ -f "$target/MANIFEST.sha256" ] && [ -f "$target/dist/ops-http.js" ] || { echo 'release incomplete' >&2; exit 65; }
+    (cd "$target" && /usr/bin/sha256sum -c MANIFEST.sha256 >/dev/null)
+    if [ -L "$pointer" ]; then /usr/bin/readlink -f "$pointer" > "$previous"; fi
+    atomic_switch "$pointer" "$target"
+    [ "$track" != production ] || set_release_env "$target"
+    printf 'DEPLOYED=%s\n' "$target"
+    ;;
+  rollback)
+    track=${2:-}
+    case "$track" in
+      production) pointer="$ops_root/current"; previous="$ops_root/rollback/production.previous" ;;
+      test) pointer="$ops_root/state/test-current"; previous="$ops_root/rollback/test.previous" ;;
+      *) echo 'invalid track' >&2; exit 64 ;;
+    esac
+    [ -f "$previous" ] || { echo 'no previous release recorded' >&2; exit 65; }
+    target=$(cat "$previous")
+    case "$target" in "$ops_root"/releases/*|"$ops_root"/test-releases/*) ;; *) echo 'previous target outside release roots' >&2; exit 65;; esac
+    [ -d "$target" ] && [ -f "$target/MANIFEST.sha256" ] || { echo 'previous release unavailable' >&2; exit 65; }
+    (cd "$target" && /usr/bin/sha256sum -c MANIFEST.sha256 >/dev/null)
+    atomic_switch "$pointer" "$target"
+    [ "$track" != production ] || set_release_env "$target"
+    printf 'ROLLED_BACK=%s\n' "$target"
+    ;;
+  *)
+    echo 'operation not approved' >&2
+    exit 64
+    ;;
+esac
