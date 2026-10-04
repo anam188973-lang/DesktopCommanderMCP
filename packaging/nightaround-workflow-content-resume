@@ -1,0 +1,66 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+export PYTHONDONTWRITEBYTECODE=1
+[ "$#" -eq 0 ] || { echo 'arguments are not accepted' >&2; exit 64; }
+RUNTIME=/srv/ai-doer-mcp/nightaround-selected-runtime2
+WFROOT=/srv/nightaround-workflow-content
+APPROVAL="$WFROOT/current.approval"
+[ -f "$APPROVAL" ] || { echo 'workflow approval missing' >&2; exit 65; }
+read -r WORKFLOW_RELEASE APPROVED_MANIFEST_HASH EXTRA < "$APPROVAL"
+[ -z "${EXTRA:-}" ] || { echo 'workflow approval invalid' >&2; exit 65; }
+case "$WORKFLOW_RELEASE" in ''|*[!A-Za-z0-9._-]*) echo 'workflow release name invalid' >&2; exit 65;; esac
+WF=/srv/nightaround-ops/workflow-candidates/$WORKFLOW_RELEASE
+[ -f "$WF/MANIFEST.sha256" ] && [ -f "$WF/workflow-release.json" ] || { echo 'workflow candidate incomplete' >&2; exit 65; }
+ACTUAL_MANIFEST_HASH=$(sha256sum "$WF/MANIFEST.sha256" | awk '{print $1}')
+[ "$ACTUAL_MANIFEST_HASH" = "$APPROVED_MANIFEST_HASH" ] || { echo 'workflow release changed after approval' >&2; exit 65; }
+(cd "$WF" && sha256sum -c MANIFEST.sha256 >/dev/null)
+/usr/local/sbin/nightaround-validate-workflow-release "$WF" >/dev/null
+[ "$(id -un)" = ai-doer-mcp ] || { echo 'wrong execution identity' >&2; exit 77; }
+HANDOFF="$RUNTIME/data/exports/s07_s09_handoff_v2.json"
+LOCK="$RUNTIME/db/locks/s01_s10_draft_only.lock"
+BUNDLE="$WF/config/danang_cocktail_s08_bundle_candidate_v3.json"
+S085="$WF/config/danang_cocktail_s08_5_effective_selection_candidate_v2.json"
+CONTROL="$WF/config/workflow_content_control_plane_v2.json"
+for f in "$HANDOFF" "$LOCK" "$BUNDLE" "$S085" "$CONTROL" "$WF/src/content_automation/projects/nightlife/reconciled_runner_v2.py"; do
+  [ -e "$f" ] || { echo "required workflow artifact missing: $f" >&2; exit 65; }
+done
+PYTHONPATH="$WF/src:$RUNTIME/src" "$RUNTIME/.venv/bin/python" - "$WF" "$HANDOFF" "$BUNDLE" "$S085" "$CONTROL" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+wf,handoff,bundle,lock,control=map(Path,sys.argv[1:])
+m=json.loads((wf/'workflow-release.json').read_text())
+h=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+assert m['contract']=='NIGHTAROUND.WORKFLOW_CONTENT_RELEASE.V2'
+assert m['execution_mode']=='DEVELOPMENT_TEST_ONLY'
+assert m['model']=='gpt-6-luna' and float(m['cost_ceiling_usd'])==0.45
+assert m['expected_s07_sha256']==h(handoff)
+assert m['expected_s08_sha256']==h(bundle)
+assert m['expected_s08_5_sha256']==h(lock)
+assert m['control_plane_sha256']==h(control)
+assert m['public_publish_allowed'] is False
+assert m['indexing_change_allowed'] is False
+assert m['production_url_freeze_allowed'] is False
+assert m['autonomous_public_publish'] is False
+PY
+if [ "${NIGHTAROUND_WORKFLOW_PREFLIGHT_ONLY:-0}" = 1 ]; then
+  printf '%s\n' "WORKFLOW_CONTENT_V2_PREFLIGHT=PASS release=$WORKFLOW_RELEASE model=gpt-6-luna cost_ceiling_usd=0.45 public_publish_allowed=false"
+  exit 0
+fi
+exec 9>>"$LOCK"
+flock -n 9 || { echo 'workflow-content stage lock is held' >&2; exit 75; }
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="$RUNTIME/runtime_outputs/workflow_content_reconcile_v2/run_$STAMP"
+mkdir -p "$OUT"
+OPENAI_API_KEY="$(/usr/bin/gcloud secrets versions access latest --secret nightlife-openai-api-key --project nightlife-seo 2>/dev/null)" || { echo 'server-side secret access failed' >&2; exit 69; }
+[ -n "$OPENAI_API_KEY" ] || { echo 'server-side secret is empty' >&2; exit 69; }
+export OPENAI_API_KEY PYTHONPATH="$WF/src:$RUNTIME/src"
+"$RUNTIME/.venv/bin/python" - "$RUNTIME" "$BUNDLE" "$S085" "$CONTROL" "$OUT" <<'PY'
+import json,sys
+from pathlib import Path
+from content_automation.projects.nightlife.reconciled_runner_v2 import run
+r=run(runtime_root=Path(sys.argv[1]),bundle_path=Path(sys.argv[2]),lock_path=Path(sys.argv[3]),control_plane_path=Path(sys.argv[4]),output_dir=Path(sys.argv[5]))
+print(json.dumps(r,ensure_ascii=False,sort_keys=True))
+PY
+unset OPENAI_API_KEY
+printf 'WORKFLOW_CONTENT_V2_OUTPUT=%s\n' "$OUT"
