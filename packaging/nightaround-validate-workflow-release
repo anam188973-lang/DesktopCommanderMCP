@@ -1,0 +1,49 @@
+#!/usr/bin/python3
+import hashlib,json,sys
+from pathlib import Path
+
+def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def read(path): return json.loads(Path(path).read_text())
+root=Path(sys.argv[1]).resolve()
+if root.parent != Path('/srv/nightaround-ops/workflow-candidates'):
+    raise SystemExit('candidate outside workflow staging root')
+p=read(root/'workflow-release.json')
+contract=p.get('contract')
+if contract == 'NIGHTAROUND.WORKFLOW_CONTENT_RELEASE.V1':
+    required={
+      'contract':'NIGHTAROUND.WORKFLOW_CONTENT_RELEASE.V1','lane':'workflow-content','release':root.name,
+      'page_id':'nlp_26b60a5386792140937bfcbc','model':'gpt-6-luna','cost_ceiling_usd':0.45,
+      'max_repairs':1,'stage_boundary':'S10_STOP','s11_allowed':False,'wordpress_allowed':False,'page2_allowed':False,
+      'expected_s07_sha256':'5b7da0be8668a369308fc7486a81663487ef9a99968b0c9286a507a8a2e3240b',
+      'expected_s08_sha256':'ea86f25bd9dfbbcd31b53d628411376ef7f5c80f76a7d952798ae19b79f5a76a',
+      'overlay_entry':'src/content_automation/projects/nightlife/selected_content_pipeline_v2.py'}
+    for k,v in required.items():
+        if p.get(k)!=v: raise SystemExit(f'workflow V1 policy mismatch: {k}')
+    if not (root/p['overlay_entry']).is_file(): raise SystemExit('overlay entry missing')
+elif contract == 'NIGHTAROUND.WORKFLOW_CONTENT_RELEASE.V2':
+    required={'lane':'workflow-content','release':root.name,'page_id':'nlp_26b60a5386792140937bfcbc',
+      'execution_mode':'DEVELOPMENT_TEST_ONLY','model':'gpt-6-luna','cost_ceiling_usd':0.45,'max_repairs':1,
+      'wordpress_draft_allowed':True,'public_publish_allowed':False,'indexing_change_allowed':False,
+      'production_url_freeze_allowed':False,'post_publish_simulation_allowed':True,
+      'post_publish_simulation_data_class':'DEVELOPMENT_FIXTURE','autonomous_public_publish':False}
+    for k,v in required.items():
+        if p.get(k)!=v: raise SystemExit(f'workflow V2 policy mismatch: {k}')
+    paths={'s08':root/'config/danang_cocktail_s08_bundle_candidate_v3.json',
+      's085':root/'config/danang_cocktail_s08_5_effective_selection_candidate_v2.json',
+      'control':root/'config/workflow_content_control_plane_v2.json',
+      'pipeline':root/'src/content_automation/projects/nightlife/selected_content_pipeline_v2.py',
+      'contract':root/'src/content_automation/projects/nightlife/workflow_contract_v2.py',
+      'runner':root/'src/content_automation/projects/nightlife/reconciled_runner_v2.py'}
+    for k,v in paths.items():
+        if not v.is_file(): raise SystemExit(f'workflow V2 file missing: {k}')
+    checks={'expected_s08_sha256':sha(paths['s08']),'expected_s08_5_sha256':sha(paths['s085']),'control_plane_sha256':sha(paths['control'])}
+    for k,v in checks.items():
+        if p.get(k)!=v: raise SystemExit(f'workflow V2 hash mismatch: {k}')
+    bundle,lock,control=read(paths['s08']),read(paths['s085']),read(paths['control'])
+    if lock.get('status')!='PASS' or [x.get('venue_id') for x in bundle.get('venues',[])]!=lock.get('selected_venue_ids'):
+        raise SystemExit('workflow V2 S08/S08.5 mismatch')
+    if control.get('execution_mode')!='DEVELOPMENT_TEST_ONLY' or control.get('prepublish',{}).get('public_publish_allowed') is not False or control.get('ia',{}).get('canonical_may_be_frozen_during_testing') is not False:
+        raise SystemExit('workflow V2 control-plane safety mismatch')
+else:
+    raise SystemExit('unsupported workflow release contract')
+print(f'WORKFLOW_RELEASE_VALIDATION=PASS contract={contract}')
