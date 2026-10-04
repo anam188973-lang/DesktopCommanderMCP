@@ -1,0 +1,29 @@
+[Unit]
+Description=Nightaround Workflow Content V2 reconciled development-test runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ai-doer-mcp
+Group=ai-doer-mcp
+WorkingDirectory=/srv/ai-doer-mcp/nightaround-selected-runtime2
+Environment=HOME=/srv/ai-doer-mcp
+Environment=PATH=/usr/bin:/bin:/usr/local/bin
+ExecStart=/bin/bash /srv/nightaround-ops/current/packaging/nightaround-workflow-content-resume
+TimeoutStartSec=30min
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/ai-doer-mcp/nightaround-selected-runtime2/runtime_outputs
+ReadWritePaths=/srv/ai-doer-mcp/nightaround-selected-runtime2/db/locks
+ReadWritePaths=/srv/ai-doer-mcp/.config/gcloud
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+StandardOutput=journal
+StandardError=journal
